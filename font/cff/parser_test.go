@@ -156,6 +156,47 @@ func TestIssue122(t *testing.T) {
 	tu.Assert(t, len(segments) == 12)
 }
 
+// TestCFF2LocalSubrs covers a CFF2 font whose Private DICT declares local
+// subroutines. The Subrs offset is relative to the Private DICT, not to the
+// start of the table, so resolving it from the wrong base reads an arbitrary
+// position: with this fixture that lands on a byte giving offSize 140 and the
+// table is rejected outright, and on other fonts it can present a count of
+// hundreds of millions, or an offSize of 0.
+//
+// Because NewFont discards the error from loadCff2, a font in that state loads
+// with no CFF2 outlines at all rather than failing, which is why this went
+// unnoticed: the only other CFF2 fixture, NotoSansCJKjp-VF.otf, declares no
+// local subroutines and so never reaches the code.
+func TestCFF2LocalSubrs(t *testing.T) {
+	b, err := td.Files.ReadFile("toys/CFF2-VF.otf")
+	tu.AssertNoErr(t, err)
+
+	ft, err := ot.NewLoader(bytes.NewReader(b))
+	tu.AssertNoErr(t, err)
+
+	table, err := ft.RawTable(ot.MustNewTag("CFF2"))
+	tu.AssertNoErr(t, err)
+
+	out, err := ParseCFF2(table)
+	tu.AssertNoErr(t, err)
+
+	// the fixture declares local subroutines; if it stops doing so this test
+	// no longer covers anything and should be pointed at another font
+	nSubrs := 0
+	for _, f := range out.fonts {
+		nSubrs += len(f.localSubrs)
+	}
+	tu.Assert(t, nSubrs != 0)
+
+	// every glyph must interpret, which is what actually exercises the subrs:
+	// a charstring calling callsubr with a wrongly located INDEX fails here
+	tu.Assert(t, len(out.Charstrings) != 0)
+	for i := range out.Charstrings {
+		_, _, err := out.LoadGlyph(uint16(i), nil)
+		tu.AssertNoErr(t, err)
+	}
+}
+
 // TestParseIndexContentBounds guards against a malformed INDEX header driving
 // a huge allocation. The CFF2 INDEX header parser does not validate offSize
 // (unlike CFF1), so a font can present offSize 0 — which zeroes the length
