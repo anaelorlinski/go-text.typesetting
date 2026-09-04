@@ -4,6 +4,7 @@ package cff
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"reflect"
 	"testing"
@@ -195,6 +196,91 @@ func TestCFF2LocalSubrs(t *testing.T) {
 		_, _, err := out.LoadGlyph(uint16(i), nil)
 		tu.AssertNoErr(t, err)
 	}
+}
+
+// buildCFF2LocalSubrs assembles a minimal CFF2 table whose Private DICT
+// declares local subroutines.
+//
+// It is synthetic rather than a font file so the case can be pinned exactly:
+// the Subrs offset is placed so that resolving it from the start of the table,
+// rather than from the Private DICT, lands inside the Top DICT and yields a
+// byte that is not a legal offSize. Real fonts differ only in what the wrong
+// address happens to contain.
+func buildCFF2LocalSubrs() []byte {
+	be32 := func(v uint32) []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, v); return b }
+	dictInt := func(v int32) []byte { return append([]byte{29}, be32(uint32(v))...) }
+
+	// a CFF2 INDEX: count uint32, offSize uint8, count+1 offsets, then data
+	index := func(items ...[]byte) []byte {
+		out := be32(uint32(len(items)))
+		if len(items) == 0 {
+			return out
+		}
+		out = append(out, 1) // offSize
+		off := byte(1)
+		offs := []byte{off}
+		for _, it := range items {
+			off += byte(len(it))
+			offs = append(offs, off)
+		}
+		out = append(out, offs...)
+		for _, it := range items {
+			out = append(out, it...)
+		}
+		return out
+	}
+
+	const headerSize = 5
+	const topDictLen = 6 + 7 // CharStrings, then FDArray
+	const privDictLen = 6    // Subrs
+	charStringsOff := headerSize + topDictLen
+	charStrings := index([]byte{0x0b}) // one glyph: return
+	fdArrayOff := charStringsOff + len(charStrings)
+
+	fontDict := func(privOff int) []byte {
+		fd := append(dictInt(privDictLen), dictInt(int32(privOff))...)
+		return append(fd, 18) // Private [size, offset]
+	}
+	// the Font DICT's length does not depend on the value, so the offsets
+	// stay put when it is filled in
+	privDictOff := fdArrayOff + len(index(fontDict(0)))
+	fdArray := index(fontDict(privDictOff))
+
+	// "The local subrs offset is relative to the beginning of the Private
+	// DICT data", so the INDEX sits immediately after it and the operand is
+	// the DICT's own length
+	privDict := append(dictInt(privDictLen), 19) // Subrs
+	localSubrs := index([]byte{0x0b, 0x0b}, []byte{0x0b, 0x0b, 0x0b})
+
+	out := []byte{2, 0, headerSize, 0, 0}
+	binary.BigEndian.PutUint16(out[3:], topDictLen)
+	top := append(dictInt(int32(charStringsOff)), 17)
+	top = append(top, dictInt(int32(fdArrayOff))...)
+	top = append(top, 12, 36)
+	out = append(out, top...)
+	out = append(out, charStrings...)
+	out = append(out, fdArray...)
+	out = append(out, privDict...)
+	return append(out, localSubrs...)
+}
+
+// TestCFF2LocalSubrsOffset pins that a Private DICT's Subrs operand is resolved
+// relative to the Private DICT and not to the start of the table.
+//
+// Reading it from the wrong base gives whatever happens to be at that address.
+// Here it is a byte inside the Top DICT that is not a legal offSize, so the
+// table is rejected; on the fonts that prompted this it was an offSize of 0 or
+// a count of tens of millions. Because NewFont discards the error from
+// loadCff2, the visible effect in all of those cases is a font that loads with
+// no CFF2 outlines at all.
+func TestCFF2LocalSubrsOffset(t *testing.T) {
+	out, err := ParseCFF2(buildCFF2LocalSubrs())
+	tu.AssertNoErr(t, err)
+
+	tu.Assert(t, len(out.fonts) == 1)
+	subrs := out.fonts[0].localSubrs
+	tu.Assert(t, len(subrs) == 2)
+	tu.Assert(t, len(subrs[0]) == 2 && len(subrs[1]) == 3)
 }
 
 // TestParseIndexContentBounds guards against a malformed INDEX header driving
